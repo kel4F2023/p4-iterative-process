@@ -1,9 +1,8 @@
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.dsl.expressions.StringToAttributeConversionHelper
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.LongType
 
-object PageRank {
+object PageRankCopy {
 
   // Do not modify
   val PageRankIterations = 10
@@ -49,12 +48,16 @@ object PageRank {
       .distinct()
       .select("user_id", "follower_id")
       .select(col("user_id").cast(LongType), col("follower_id").cast(LongType))
+      .repartition(col("follower_id"))
       .cache()
 
     val users = graph
       .select("user_id")
       .union(graph.select("follower_id"))
       .distinct()
+      .withColumnRenamed("user_id", "follower_id")
+      .repartition(col("follower_id"))
+      .cache()
 
     val n = users.count()
     val intercept = (1.0 - d)/ n
@@ -63,19 +66,21 @@ object PageRank {
       .groupBy("follower_id")
       .count()
       .withColumnRenamed("count", "follows_count")
-      .withColumnRenamed("follower_id", "user_id_follows_count")
+      .repartition(col("follower_id"))
+      .cache()
 
     // Initialize the ranks of the users
     var ranks = users
       .withColumn("rank", lit(1.0 / n))
-      .withColumnRenamed("user_id", "user_id_rank")
 
     val danglingUsers = users
-      .join(followsCount, users("user_id") === followsCount("user_id_follows_count"), "left_anti")
+      .withColumnRenamed("user_id", "user_id_follows_count")
+      .repartition(col("user_id_follows_count"))
+      .join(followsCount.repartition(col("user_id_follows_count")), col("user_id_follows_count"), "left_anti")
 
     var ranksPerFollow = graph
-      .join(ranks, graph("follower_id") === ranks("user_id_rank"))
-      .drop("user_id_rank")
+      .repartition(col("follower_id"))
+      .join(ranks.repartition(col("follower_id")), col("follower_id"))
       .withColumnRenamed("rank", "follower_rank")
       .join(followsCount, graph("follower_id") === followsCount("user_id_follows_count"))
       .drop("user_id_follows_count")

@@ -2,3 +2,6 @@
 data
 submitter*
 *.log
+.bsp
+project
+target

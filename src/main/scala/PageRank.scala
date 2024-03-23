@@ -122,11 +122,13 @@ object PageRank {
        sc.setJobDescription(null)
      }
 
+    sc.setJobDescription("PageRank saving results")
     ranks
       .write
       .option("delimiter", "\t")
       .option("header", "false")
       .csv(pageRankOutputPath)
+    sc.setJobDescription(null)
 
   }
 

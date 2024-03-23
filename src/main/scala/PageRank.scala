@@ -1,5 +1,4 @@
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.dsl.expressions.StringToAttributeConversionHelper
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.LongType
 
@@ -49,12 +48,16 @@ object PageRank {
       .distinct()
       .select("user_id", "follower_id")
       .select(col("user_id").cast(LongType), col("follower_id").cast(LongType))
+      .repartition(col("follower_id"))
       .cache()
 
     val users = graph
       .select("user_id")
       .union(graph.select("follower_id"))
       .distinct()
+      .withColumnRenamed("user_id", "follower_id")
+      .repartition(col("follower_id"))
+      .cache()
 
     val n = users.count()
     val intercept = (1.0 - d)/ n
@@ -63,54 +66,64 @@ object PageRank {
       .groupBy("follower_id")
       .count()
       .withColumnRenamed("count", "follows_count")
-      .withColumnRenamed("follower_id", "user_id_follows_count")
+      .repartition(col("follower_id"))
+      .cache()
 
     // Initialize the ranks of the users
     var ranks = users
       .withColumn("rank", lit(1.0 / n))
-      .withColumnRenamed("user_id", "user_id_rank")
+      .repartition(col("follower_id"))
 
     val danglingUsers = users
-      .join(followsCount, users("user_id") === followsCount("user_id_follows_count"), "left_anti")
+      .join(followsCount, users("follower_id")===followsCount("follower_id"), "left_anti")
+      .repartition(col("follower_id"))
 
-    var ranksPerFollow = graph
-      .join(ranks, graph("follower_id") === ranks("user_id_rank"))
-      .drop("user_id_rank")
+
+    var rankPerFollow = graph
+      .join(ranks, "follower_id")
       .withColumnRenamed("rank", "follower_rank")
-      .join(followsCount, graph("follower_id") === followsCount("user_id_follows_count"))
-      .drop("user_id_follows_count")
-      .withColumnRenamed("follows_count", "follower_follows_count")
+      .repartition(col("follower_id"))
 
-    for (_ <- 1 to iterations) {
-      var contribes = ranksPerFollow
+    var rankFollowersPerFollow = rankPerFollow
+      .join(followsCount, "follower_id")
+      .withColumnRenamed("follows_count", "follower_follows_count")
+      .repartition(col("follower_id"))
+
+
+     for (_ <- 1 to iterations) {
+      var contribes = rankFollowersPerFollow
         .groupBy("user_id")
         .agg(sum(col("follower_rank") / col("follower_follows_count")).as("contribution"))
-        .withColumnRenamed("user_id", "user_id_rank")
+        .withColumnRenamed("user_id", "follower_id")
+        .repartition(col("follower_id"))
 
-      var dangling = danglingUsers
-        .join(ranks, danglingUsers("user_id") === ranks("user_id_rank"))
+      var dangling = ranks
+        .join(broadcast(danglingUsers), "follower_id")
         .agg(sum(col("rank")))
         .collect()(0)(0).asInstanceOf[Double] / n
 
       var newRanks = ranks
-        .join(contribes, Seq("user_id_rank"), "left")
+        .join(contribes, Seq("follower_id"), "left")
         .withColumn(
           "contribution",
           when(col("contribution").isNull, lit(intercept) + lit(d) * lit(dangling))
             .otherwise(lit(intercept) + lit(d) * (col("contribution") + dangling)))
         .drop("rank")
         .withColumnRenamed("contribution", "rank")
+        .repartition(col("follower_id"))
 
-      ranksPerFollow = graph
-        .join(newRanks, graph("follower_id") === newRanks("user_id_rank"))
-        .drop("user_id_rank")
+      rankPerFollow = graph
+        .join(newRanks, "follower_id")
         .withColumnRenamed("rank", "follower_rank")
-        .join(followsCount, graph("follower_id") === followsCount("user_id_follows_count"))
-        .drop("user_id_follows_count")
+        .repartition(col("follower_id"))
+
+      rankFollowersPerFollow = rankPerFollow
+        .join(followsCount, "follower_id")
         .withColumnRenamed("follows_count", "follower_follows_count")
+        .repartition(col("follower_id"))
 
       ranks = newRanks
-    }
+     }
 
     ranks
       .write

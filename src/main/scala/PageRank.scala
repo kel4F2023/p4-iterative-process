@@ -40,6 +40,7 @@ object PageRank {
       spark: SparkSession): Unit = {
 
     val d = 0.85
+    val sc = spark.sparkContext
 
     val graph = spark.read
       .option("delimiter", "\t")
@@ -74,11 +75,6 @@ object PageRank {
       .withColumn("rank", lit(1.0 / n))
       .repartition(col("follower_id"))
 
-    val danglingUsers = users
-      .join(followsCount, users("follower_id")===followsCount("follower_id"), "left_anti")
-      .repartition(col("follower_id"))
-
-
     var rankPerFollow = graph
       .join(ranks, "follower_id")
       .withColumnRenamed("rank", "follower_rank")
@@ -90,17 +86,17 @@ object PageRank {
       .repartition(col("follower_id"))
 
 
-     for (_ <- 1 to iterations) {
+     for (i <- 1 to iterations) {
+       sc.setJobDescription(s"PageRank iteration ${i}")
       var contribes = rankFollowersPerFollow
         .groupBy("user_id")
         .agg(sum(col("follower_rank") / col("follower_follows_count")).as("contribution"))
         .withColumnRenamed("user_id", "follower_id")
         .repartition(col("follower_id"))
+        .cache()
 
-      var dangling = ranks
-        .join(broadcast(danglingUsers), "follower_id")
-        .agg(sum(col("rank")))
-        .collect()(0)(0).asInstanceOf[Double] / n
+      var dangling =
+        ( 1 - contribes.agg(sum(col("contribution")).as("total")).collect()(0).getAs[Double]("total")) / n
 
       var newRanks = ranks
         .join(contribes, Seq("follower_id"), "left")
@@ -123,6 +119,7 @@ object PageRank {
         .repartition(col("follower_id"))
 
       ranks = newRanks
+       sc.setJobDescription(null)
      }
 
     ranks

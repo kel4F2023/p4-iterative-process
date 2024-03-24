@@ -144,7 +144,7 @@ object PageRank {
         .cache()
 
       var dangling =
-        ( 1 - contribes.agg(sum(col("contribution")).as("total")).collect()(0).getAs[Double]("total")) / n
+        ( 1 - contribes.agg(sum(col("contribution")).as("total")).first().getAs[Double]("total")) / n
 
       var newRanks = ranks
         .join(contribes, Seq("follower_id"), "left")

@@ -4,6 +4,20 @@ import org.apache.spark.sql.types.{DoubleType, LongType}
 
 object PageRank {
 
+  def myGreater(a: Column, b: Column): Column = {
+    when(a.isNull && b.isNull, null)
+      .when(a.isNull, b)
+      .when(b.isNull, a)
+      .when(a.getField("freq") > b.getField("freq"), a)
+      .when(a.getField("freq") < b.getField("freq"), b)
+      .when(a.getField("follower_id") < b.getField("follower_id"), a)
+      .otherwise(b)
+  }
+
+  def myGreatest(a: Column, b: Column, c: Column): Column = {
+    myGreater(a, myGreater(b, c))
+  }
+
   // Do not modify
   val PageRankIterations = 10
 
@@ -180,9 +194,9 @@ object PageRank {
 
       recommend = recommend
         .join(newRecommend, Seq("follower_id"), "left")
-        .withColumn("games", when(col("games").isNull, null).otherwise(greatest(col("games"), col("new_games"))))
-        .withColumn("movies", when(col("movies").isNull, null).otherwise(greatest(col("movies"), col("new_movies"))))
-        .withColumn("music", when(col("music").isNull, null).otherwise(greatest(col("music"), col("new_music"))))
+        .withColumn("games", when(col("games").isNull, null).otherwise(myGreater(col("games"), col("new_games"))))
+        .withColumn("movies", when(col("movies").isNull, null).otherwise(myGreater(col("movies"), col("new_movies"))))
+        .withColumn("music", when(col("music").isNull, null).otherwise(myGreater(col("music"), col("new_music"))))
         .drop("new_games", "new_movies", "new_music")
         .repartition(col("follower_id"))
 
@@ -198,7 +212,7 @@ object PageRank {
 
 
     recommend
-      .withColumn("recommendations", greatest(col("games"), col("movies"), col("music")))
+      .withColumn("recommendations", myGreatest(col("games"), col("movies"), col("music")))
       .withColumn("recommend_user_id", col("recommendations.follower_id"))
       .withColumn("recommend_freq", col("recommendations.freq"))
       .drop("games", "movies", "music", "recommendations")
@@ -206,6 +220,8 @@ object PageRank {
       .option("delimiter", "\t")
       .option("header", "false")
       .csv(recsOutputPath)
+
+    recommend.show()
 
     sc.setJobDescription(null)
   }

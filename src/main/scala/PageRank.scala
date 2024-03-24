@@ -54,7 +54,7 @@ object PageRank {
       .repartition(col("follower_id"))
       .cache()
 
-    var topics = spark.read
+    val topics = spark.read
       .option("delimiter", "\t")
       .option("header", "true")
       .csv(graphTopicsPath)
@@ -79,13 +79,14 @@ object PageRank {
       .repartition(col("follower_id"))
       .cache()
 
-    var userTopics = users
+    val userTopics = users
       .join(topics, "follower_id")
       .repartition(col("follower_id"))
 
     val n = users.count()
     val intercept = (1.0 - d)/ n
 
+    // initialize the follows count of the users
     val followsCount = graph
       .groupBy("follower_id")
       .count()
@@ -94,18 +95,8 @@ object PageRank {
       .cache()
 
     // Initialize the ranks of the users
-    var ranks = users
+    val ranks = users
       .withColumn("rank", lit(1.0 / n))
-      .repartition(col("follower_id"))
-
-    var rankPerFollow = graph
-      .join(ranks, "follower_id")
-      .withColumnRenamed("rank", "follower_rank")
-      .repartition(col("follower_id"))
-
-    var rankFollowersPerFollow = rankPerFollow
-      .join(followsCount, "follower_id")
-      .withColumnRenamed("follows_count", "follower_follows_count")
       .repartition(col("follower_id"))
 
     // Initialize the recommendations of the users
@@ -126,52 +117,30 @@ object PageRank {
           .otherwise(struct(col("music").cast(DoubleType).as("freq"), col("follower_id").cast(LongType).as("follower_id")))
       )
       .repartition(col("follower_id"))
-
-    val selfGraph = graph
-      .union(graph.select("follower_id", "follower_id"))
-      .repartition(col("follower_id"))
       .cache()
+
+    var rankCountRecommend = ranks
+      .join(recommend, "follower_id")
+      .join(followsCount, Seq("follower_id"), "left")
+
+
+//    val selfGraph = graph
+//      .union(graph.select("follower_id", "follower_id"))
+//      .repartition(col("follower_id"))
+//      .cache()
 
 
 
     for (i <- 1 to iterations) {
       sc.setJobDescription(s"PageRank iteration ${i}")
-      var contribes = rankFollowersPerFollow
-        .groupBy("user_id")
-        .agg(sum(col("follower_rank") / col("follower_follows_count")).as("contribution"))
-        .withColumnRenamed("user_id", "follower_id")
-        .repartition(col("follower_id"))
-        .cache()
-
-      var dangling =
-        ( 1 - contribes.agg(sum(col("contribution")).as("total")).collect()(0).getAs[Double]("total")) / n
-
-      var newRanks = ranks
-        .join(contribes, Seq("follower_id"), "left")
-        .withColumn(
-          "contribution",
-          when(col("contribution").isNull, lit(intercept) + lit(d) * lit(dangling))
-            .otherwise(lit(intercept) + lit(d) * (col("contribution") + dangling)))
-        .drop("rank")
-        .withColumnRenamed("contribution", "rank")
+      val rankCountRecommendPerFollow = rankCountRecommend
+        .join(graph, "follower_id")
         .repartition(col("follower_id"))
 
-      rankPerFollow = graph
-        .join(newRanks, "follower_id")
-        .withColumnRenamed("rank", "follower_rank")
-        .repartition(col("follower_id"))
-
-      rankFollowersPerFollow = rankPerFollow
-        .join(followsCount, "follower_id")
-        .withColumnRenamed("follows_count", "follower_follows_count")
-        .repartition(col("follower_id"))
-
-      ranks = newRanks
-
-      var newRecommend = selfGraph
-        .join(recommend, "follower_id")
+      val contribes = rankCountRecommendPerFollow
         .groupBy("user_id")
         .agg(
+          sum(col("rank") / col("follows_count")).as("contribution"),
           max(col("games")).as("new_games"),
           max(col("movies")).as("new_movies"),
           max(col("music")).as("new_music")
@@ -179,26 +148,46 @@ object PageRank {
         .withColumnRenamed("user_id", "follower_id")
         .repartition(col("follower_id"))
 
-      recommend = recommend
-        .join(newRecommend, Seq("follower_id"), "left")
+      val dangling =
+        (1 - contribes.agg(sum(col("contribution")).as("total")).collect()(0).getAs[Double]("total")) / n
+
+      rankCountRecommend = rankCountRecommend
+        .join(contribes, Seq("follower_id"), "left")
+        .withColumn(
+          "contribution",
+          when(col("contribution").isNull, lit(intercept) + lit(d) * lit(dangling))
+            .otherwise(lit(intercept) + lit(d) * (col("contribution") + dangling)))
+        .drop("rank")
         .withColumn("games", when(col("games").isNull, null).when(col("new_games").isNull, col("games")).otherwise(col("new_games")))
         .withColumn("movies", when(col("movies").isNull, null).when(col("new_movies").isNull, col("movies")).otherwise(col("new_movies")))
         .withColumn("music", when(col("music").isNull, null).when(col("new_music").isNull, col("music")).otherwise(col("new_music")))
         .drop("new_games", "new_movies", "new_music")
+        .withColumnRenamed("contribution", "rank")
         .repartition(col("follower_id"))
 
        sc.setJobDescription(null)
      }
 
     sc.setJobDescription("PageRank saving results")
-    ranks
+    rankCountRecommend.cache()
+
+    rankCountRecommend
+      .select("follower_id", "rank")
       .write
       .option("delimiter", "\t")
       .option("header", "false")
       .csv(pageRankOutputPath)
 
-
     recommend
+      .withColumnRenamed("games", "new_games")
+      .withColumnRenamed("movies", "new_movies")
+      .withColumnRenamed("music", "new_music")
+      .repartition(col("follower_id"))
+      .join(rankCountRecommend.select("follower_id", "games", "movies", "music"), "follower_id")
+      .withColumn("games", when(col("games").isNull, null).otherwise(greatest(col("games"), col("new_games"))))
+      .withColumn("movies", when(col("movies").isNull, null).otherwise(greatest(col("movies"), col("new_movies"))))
+      .withColumn("music", when(col("music").isNull, null).otherwise(greatest(col("music"), col("new_music"))))
+      .drop("new_games", "new_movies", "new_music")
       .withColumn("recommendations", greatest(col("games"), col("movies"), col("music")))
       .withColumn("recommend_user_id", col("recommendations.follower_id"))
       .withColumn("recommend_freq", col("recommendations.freq"))

@@ -1,6 +1,6 @@
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{Column, SparkSession}
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.types.LongType
+import org.apache.spark.sql.types.{DoubleType, LongType}
 
 object PageRank {
 
@@ -42,6 +42,8 @@ object PageRank {
     val d = 0.85
     val sc = spark.sparkContext
 
+    sc.setJobDescription("Loading data")
+
     val graph = spark.read
       .option("delimiter", "\t")
       .csv(inputGraphPath)
@@ -52,6 +54,23 @@ object PageRank {
       .repartition(col("follower_id"))
       .cache()
 
+    var topics = spark.read
+      .option("delimiter", "\t")
+      .option("header", "true")
+      .csv(graphTopicsPath)
+      .toDF("follower_id", "games", "movies", "music")
+      .withColumn("games",
+        when(col("games") < 3.0, null)
+          .otherwise(col("games").cast(DoubleType)))
+      .withColumn("movies",
+        when(col("movies") < 3.0, null)
+          .otherwise(col("movies").cast(DoubleType)))
+      .withColumn("music",
+        when(col("music") < 3.0, null)
+          .otherwise(col("music").cast(DoubleType)))
+      .select(col("follower_id").cast(LongType), col("games"), col("movies"), col("music"))
+      .repartition(col("follower_id"))
+
     val users = graph
       .select("user_id")
       .union(graph.select("follower_id"))
@@ -59,6 +78,10 @@ object PageRank {
       .withColumnRenamed("user_id", "follower_id")
       .repartition(col("follower_id"))
       .cache()
+
+    var userTopics = users
+      .join(topics, "follower_id")
+      .repartition(col("follower_id"))
 
     val n = users.count()
     val intercept = (1.0 - d)/ n
@@ -85,9 +108,29 @@ object PageRank {
       .withColumnRenamed("follows_count", "follower_follows_count")
       .repartition(col("follower_id"))
 
+    // Initialize the recommendations of the users
+    var recommend = userTopics
+      .withColumn(
+        "games",
+        when(col("games").isNull, null)
+          .otherwise(struct(col("games").cast(DoubleType).as("freq"), col("follower_id").cast(LongType).as("follower_id")))
+      )
+      .withColumn(
+        "movies",
+        when(col("movies").isNull, null)
+          .otherwise(struct(col("movies").cast(DoubleType).as("freq"), col("follower_id").cast(LongType).as("follower_id")))
+      )
+      .withColumn(
+        "music",
+        when(col("music").isNull, null)
+          .otherwise(struct(col("music").cast(DoubleType).as("freq"), col("follower_id").cast(LongType).as("follower_id")))
+      )
+      .repartition(col("follower_id"))
 
-     for (i <- 1 to iterations) {
-       sc.setJobDescription(s"PageRank iteration ${i}")
+
+
+    for (i <- 1 to iterations) {
+      sc.setJobDescription(s"PageRank iteration ${i}")
       var contribes = rankFollowersPerFollow
         .groupBy("user_id")
         .agg(sum(col("follower_rank") / col("follower_follows_count")).as("contribution"))
@@ -119,6 +162,30 @@ object PageRank {
         .repartition(col("follower_id"))
 
       ranks = newRanks
+
+      var recommendPerFollow = graph
+        .join(recommend, "follower_id")
+        .repartition(col("follower_id"))
+
+
+      var newRecommend = recommendPerFollow
+        .groupBy("user_id")
+        .agg(
+          max(col("games")).as("new_games"),
+          max(col("movies")).as("new_movies"),
+          max(col("music")).as("new_music")
+        )
+        .withColumnRenamed("user_id", "follower_id")
+        .repartition(col("follower_id"))
+
+      recommend = recommend
+        .join(newRecommend, Seq("follower_id"), "left")
+        .withColumn("games", when(col("games").isNull, null).otherwise(greatest(col("games"), col("new_games"))))
+        .withColumn("movies", when(col("movies").isNull, null).otherwise(greatest(col("movies"), col("new_movies"))))
+        .withColumn("music", when(col("music").isNull, null).otherwise(greatest(col("music"), col("new_music"))))
+        .drop("new_games", "new_movies", "new_music")
+        .repartition(col("follower_id"))
+
        sc.setJobDescription(null)
      }
 
@@ -128,8 +195,19 @@ object PageRank {
       .option("delimiter", "\t")
       .option("header", "false")
       .csv(pageRankOutputPath)
-    sc.setJobDescription(null)
 
+
+    recommend
+      .withColumn("recommendations", greatest(col("games"), col("movies"), col("music")))
+      .withColumn("recommend_user_id", col("recommendations.follower_id"))
+      .withColumn("recommend_freq", col("recommendations.freq"))
+      .drop("games", "movies", "music", "recommendations")
+      .write
+      .option("delimiter", "\t")
+      .option("header", "false")
+      .csv(recsOutputPath)
+
+    sc.setJobDescription(null)
   }
 
   /**

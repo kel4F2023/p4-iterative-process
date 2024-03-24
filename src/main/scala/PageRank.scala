@@ -127,6 +127,11 @@ object PageRank {
       )
       .repartition(col("follower_id"))
 
+    val selfGraph = graph
+      .union(graph.select("follower_id", "follower_id"))
+      .repartition(col("follower_id"))
+      .cache()
+
 
 
     for (i <- 1 to iterations) {
@@ -163,12 +168,8 @@ object PageRank {
 
       ranks = newRanks
 
-      var recommendPerFollow = graph
+      var newRecommend = selfGraph
         .join(recommend, "follower_id")
-        .repartition(col("follower_id"))
-
-
-      var newRecommend = recommendPerFollow
         .groupBy("user_id")
         .agg(
           max(col("games")).as("new_games"),
@@ -180,9 +181,9 @@ object PageRank {
 
       recommend = recommend
         .join(newRecommend, Seq("follower_id"), "left")
-        .withColumn("games", when(col("games").isNull, null).otherwise(greatest(col("games"), col("new_games"))))
-        .withColumn("movies", when(col("movies").isNull, null).otherwise(greatest(col("movies"), col("new_movies"))))
-        .withColumn("music", when(col("music").isNull, null).otherwise(greatest(col("music"), col("new_music"))))
+        .withColumn("games", when(col("games").isNull, null).when(col("new_games").isNull, col("games")).otherwise(col("new_games")))
+        .withColumn("movies", when(col("movies").isNull, null).when(col("new_movies").isNull, col("movies")).otherwise(col("new_movies")))
+        .withColumn("music", when(col("music").isNull, null).when(col("new_music").isNull, col("music")).otherwise(col("new_music")))
         .drop("new_games", "new_movies", "new_music")
         .repartition(col("follower_id"))
 

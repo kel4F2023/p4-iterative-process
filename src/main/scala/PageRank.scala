@@ -123,7 +123,7 @@ object PageRank {
       .join(recommend, "follower_id")
       .join(followsCount, Seq("follower_id"), "left")
 
-
+    rankCountRecommend.cache()
 
     for (i <- 1 to iterations) {
 
@@ -167,11 +167,13 @@ object PageRank {
         .withColumnRenamed("contribution", "rank")
         .repartition(col("follower_id"))
 
-       sc.setJobDescription(null)
+      rankCountRecommend.cache()
+
+
+      sc.setJobDescription(null)
      }
 
     sc.setJobDescription("PageRank saving results")
-    rankCountRecommend.cache()
 
     rankCountRecommend
       .select("follower_id", "rank")

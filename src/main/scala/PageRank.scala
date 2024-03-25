@@ -124,18 +124,19 @@ object PageRank {
       .join(followsCount, Seq("follower_id"), "left")
 
 
-//    val selfGraph = graph
-//      .union(graph.select("follower_id", "follower_id"))
-//      .repartition(col("follower_id"))
-//      .cache()
-
-
 
     for (i <- 1 to iterations) {
+
+      if (i % 3 == 0) {
+        graph.cache()
+      }
+
       sc.setJobDescription(s"PageRank iteration ${i}")
+
       val rankCountRecommendPerFollow = rankCountRecommend
         .join(graph, "follower_id")
         .repartition(col("follower_id"))
+        .cache()
 
       val contribes = rankCountRecommendPerFollow
         .groupBy("user_id")
@@ -147,9 +148,10 @@ object PageRank {
         )
         .withColumnRenamed("user_id", "follower_id")
         .repartition(col("follower_id"))
+        .cache()
 
       val dangling =
-        (1 - contribes.agg(sum(col("contribution")).as("total")).collect()(0).getAs[Double]("total")) / n
+        (1 - contribes.select(sum(col("contribution")).as("total")).first().getAs[Double]("total")) / n
 
       rankCountRecommend = rankCountRecommend
         .join(contribes, Seq("follower_id"), "left")

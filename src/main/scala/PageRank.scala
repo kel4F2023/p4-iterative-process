@@ -135,6 +135,14 @@ object PageRank {
 
 
     for (i <- 1 to iterations) {
+
+      if (i % 3 == 0) {
+        graph.cache()
+        followsCount.cache()
+        ranks.cache()
+        recommend.cache()
+      }
+
       sc.setJobDescription(s"PageRank iteration ${i}")
       var contribes = rankFollowersPerFollow
         .groupBy("user_id")
@@ -186,6 +194,7 @@ object PageRank {
         .withColumn("music", when(col("music").isNull, null).when(col("new_music").isNull, col("music")).otherwise(col("new_music")))
         .drop("new_games", "new_movies", "new_music")
         .repartition(col("follower_id"))
+        .cache()
 
        sc.setJobDescription(null)
      }

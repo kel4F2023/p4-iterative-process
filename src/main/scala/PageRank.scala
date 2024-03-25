@@ -136,7 +136,7 @@ object PageRank {
 
     for (i <- 1 to iterations) {
 
-      if (i % 3 == 0) {
+      if (i % 4 == 0) {
         graph.cache()
         followsCount.cache()
         ranks.cache()
@@ -152,7 +152,7 @@ object PageRank {
         .cache()
 
       var dangling =
-        ( 1 - contribes.agg(sum(col("contribution")).as("total")).first().getAs[Double]("total")) / n
+        ( 1 - contribes.select(sum(col("contribution")).as("total")).first().getAs[Double]("total")) / n
 
       var newRanks = ranks
         .join(contribes, Seq("follower_id"), "left")

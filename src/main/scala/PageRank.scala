@@ -1,6 +1,6 @@
 import org.apache.spark.sql.{Column, SparkSession}
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.types.{DoubleType, LongType}
+import org.apache.spark.sql.types.{DoubleType, LongType, StructType}
 
 object PageRank {
 
@@ -44,178 +44,109 @@ object PageRank {
 
     sc.setJobDescription("Loading data")
 
-    val graph = spark.read
+    val schema = new StructType()
+      .add("follower", LongType)
+      .add("followee", LongType)
+
+    val links = spark.read
       .option("delimiter", "\t")
+      .schema(schema)
       .csv(inputGraphPath)
-      .toDF("follower_id", "user_id")
-      .distinct()
-      .select("user_id", "follower_id")
-      .select(col("user_id").cast(LongType), col("follower_id").cast(LongType))
-      .repartition(col("follower_id"))
+      .repartition(col("follower"))
       .cache()
 
-    var topics = spark.read
-      .option("delimiter", "\t")
-      .option("header", "true")
-      .csv(graphTopicsPath)
-      .toDF("follower_id", "games", "movies", "music")
-      .withColumn("games",
-        when(col("games") < 3.0, null)
-          .otherwise(col("games").cast(DoubleType)))
-      .withColumn("movies",
-        when(col("movies") < 3.0, null)
-          .otherwise(col("movies").cast(DoubleType)))
-      .withColumn("music",
-        when(col("music") < 3.0, null)
-          .otherwise(col("music").cast(DoubleType)))
-      .select(col("follower_id").cast(LongType), col("games"), col("movies"), col("music"))
-      .repartition(col("follower_id"))
-
-    val users = graph
-      .select("user_id")
-      .union(graph.select("follower_id"))
+    val users = links
+      .select(col("follower").as("user_id"))
+      .union(links.select(col("followee").as("user_id")))
       .distinct()
-      .withColumnRenamed("user_id", "follower_id")
-      .repartition(col("follower_id"))
+      .repartition(col("user_id"))
       .cache()
-
-    var userTopics = users
-      .join(topics, "follower_id")
-      .repartition(col("follower_id"))
 
     val n = users.count()
-    val intercept = (1.0 - d)/ n
+    val intercept = 0.15 / n
 
-    val followsCount = graph
-      .groupBy("follower_id")
-      .count()
-      .withColumnRenamed("count", "follows_count")
-      .repartition(col("follower_id"))
+    val userFollows = links.groupBy("follower")
+      .agg(collect_list("followee").as("followees"))
+      .repartition(col("follower"))
       .cache()
 
-    // Initialize the ranks of the users
-    var ranks = users
-      .withColumn("rank", lit(1.0 / n))
-      .repartition(col("follower_id"))
+    var ranks = userFollows
+      .select(col("followee").as("url"), lit(1.0 / n).as("rank"))
+      .distinct()
+      .repartition(col("url"))
 
-    var rankPerFollow = graph
-      .join(ranks, "follower_id")
-      .withColumnRenamed("rank", "follower_rank")
-      .repartition(col("follower_id"))
+    ranks.show()
 
-    var rankFollowersPerFollow = rankPerFollow
-      .join(followsCount, "follower_id")
-      .withColumnRenamed("follows_count", "follower_follows_count")
-      .repartition(col("follower_id"))
-
-    // Initialize the recommendations of the users
-    var recommend = userTopics
-      .withColumn(
-        "games",
-        when(col("games").isNull, null)
-          .otherwise(struct(col("games").cast(DoubleType).as("freq"), col("follower_id").cast(LongType).as("follower_id")))
-      )
-      .withColumn(
-        "movies",
-        when(col("movies").isNull, null)
-          .otherwise(struct(col("movies").cast(DoubleType).as("freq"), col("follower_id").cast(LongType).as("follower_id")))
-      )
-      .withColumn(
-        "music",
-        when(col("music").isNull, null)
-          .otherwise(struct(col("music").cast(DoubleType).as("freq"), col("follower_id").cast(LongType).as("follower_id")))
-      )
-      .repartition(col("follower_id"))
-
-    val selfGraph = graph
-      .union(graph.select("follower_id", "follower_id"))
-      .repartition(col("follower_id"))
-      .cache()
-
-
-
-    for (i <- 1 to iterations) {
-
-      if (i % 4 == 0) {
-        graph.cache()
-        followsCount.cache()
-        ranks.cache()
-        recommend.cache()
-      }
+    for (i <- 1 to 1) {
 
       sc.setJobDescription(s"PageRank iteration ${i}")
-      var contribes = rankFollowersPerFollow
-        .groupBy("user_id")
-        .agg(sum(col("follower_rank") / col("follower_follows_count")).as("contribution"))
-        .withColumnRenamed("user_id", "follower_id")
-        .repartition(col("follower_id"))
-        .cache()
 
-      var dangling =
-        ( 1 - contribes.select(sum(col("contribution")).as("total")).first().getAs[Double]("total")) / n
+      val contrib = userFollows.join(ranks, col("follower") === col("url"), "left")
+        .withColumn("contrib", lit(col("rank") / size(col("followees"))))
+        .withColumn("followee", explode(col("followees")))
+        .select(col("followee"), col("contrib"))
 
-      var newRanks = ranks
-        .join(contribes, Seq("follower_id"), "left")
-        .withColumn(
-          "contribution",
-          when(col("contribution").isNull, lit(intercept) + lit(d) * lit(dangling))
-            .otherwise(lit(intercept) + lit(d) * (col("contribution") + dangling)))
-        .drop("rank")
-        .withColumnRenamed("contribution", "rank")
-        .repartition(col("follower_id"))
+      userFollows.show()
 
-      rankPerFollow = graph
-        .join(newRanks, "follower_id")
-        .withColumnRenamed("rank", "follower_rank")
-        .repartition(col("follower_id"))
+      val dangling =
+        ( 1 - contrib.select(sum(col("contrib")).as("total")).first().getAs[Double]("total")) / n
 
-      rankFollowersPerFollow = rankPerFollow
-        .join(followsCount, "follower_id")
-        .withColumnRenamed("follows_count", "follower_follows_count")
-        .repartition(col("follower_id"))
 
-      ranks = newRanks
-
-      var newRecommend = selfGraph
-        .join(recommend, "follower_id")
-        .groupBy("user_id")
-        .agg(
-          max(col("games")).as("new_games"),
-          max(col("movies")).as("new_movies"),
-          max(col("music")).as("new_music")
+      ranks = contrib.select(col("followee").as("url"), col("contrib"))
+        .groupBy("url")
+        .agg(sum(col("contrib")).as("total_contrib"))
+        .withColumn("rank",
+          lit(intercept) + lit(d) * (col("total_contrib") + lit(dangling))
         )
-        .withColumnRenamed("user_id", "follower_id")
-        .repartition(col("follower_id"))
+        .select(col("url"), col("rank"))
+        .repartition(col("url"))
 
-      recommend = recommend
-        .join(newRecommend, Seq("follower_id"), "left")
-        .withColumn("games", when(col("games").isNull, null).when(col("new_games").isNull, col("games")).otherwise(col("new_games")))
-        .withColumn("movies", when(col("movies").isNull, null).when(col("new_movies").isNull, col("movies")).otherwise(col("new_movies")))
-        .withColumn("music", when(col("music").isNull, null).when(col("new_music").isNull, col("music")).otherwise(col("new_music")))
-        .drop("new_games", "new_movies", "new_music")
-        .repartition(col("follower_id"))
-        .cache()
+
+
+
+
+
+//      var newRecommend = selfGraph
+//        .join(userRecommends, "follower_id")
+//        .groupBy("user_id")
+//        .agg(
+//          max(col("games")).as("new_games"),
+//          max(col("movies")).as("new_movies"),
+//          max(col("music")).as("new_music")
+//        )
+//        .withColumnRenamed("user_id", "follower_id")
+//        .repartition(col("follower_id"))
+//
+//      userRecommends = userRecommends
+//        .join(newRecommend, Seq("follower_id"), "left")
+//        .withColumn("games", when(col("games").isNull, null).when(col("new_games").isNull, col("games")).otherwise(col("new_games")))
+//        .withColumn("movies", when(col("movies").isNull, null).when(col("new_movies").isNull, col("movies")).otherwise(col("new_movies")))
+//        .withColumn("music", when(col("music").isNull, null).when(col("new_music").isNull, col("music")).otherwise(col("new_music")))
+//        .drop("new_games", "new_movies", "new_music")
+//        .repartition(col("follower_id"))
+//        .cache()
 
        sc.setJobDescription(null)
      }
 
     sc.setJobDescription("PageRank saving results")
-    ranks
-      .write
-      .option("delimiter", "\t")
-      .option("header", "false")
-      .csv(pageRankOutputPath)
+//    ranks.show()
+//    ranks
+//      .write
+//      .option("delimiter", "\t")
+//      .option("header", "false")
+//      .csv(pageRankOutputPath)
 
 
-    recommend
-      .withColumn("recommendations", greatest(col("games"), col("movies"), col("music")))
-      .withColumn("recommend_user_id", col("recommendations.follower_id"))
-      .withColumn("recommend_freq", col("recommendations.freq"))
-      .drop("games", "movies", "music", "recommendations")
-      .write
-      .option("delimiter", "\t")
-      .option("header", "false")
-      .csv(recsOutputPath)
+//    userRecommends
+//      .withColumn("recommendations", greatest(col("games"), col("movies"), col("music")))
+//      .withColumn("recommend_user_id", col("recommendations.follower_id"))
+//      .withColumn("recommend_freq", col("recommendations.freq"))
+//      .drop("games", "movies", "music", "recommendations")
+//      .write
+//      .option("delimiter", "\t")
+//      .option("header", "false")
+//      .csv(recsOutputPath)
 
     sc.setJobDescription(null)
   }

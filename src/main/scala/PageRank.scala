@@ -1,3 +1,4 @@
+import org.apache.log4j.LogManager
 import org.apache.spark.sql.{Column, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{DoubleType, LongType, StructType}
@@ -44,22 +45,34 @@ object PageRank {
 
     sc.setJobDescription("Loading data")
 
+    LogManager.getRootLogger.setLevel(org.apache.log4j.Level.WARN)
+
     val schema = new StructType()
       .add("follower", LongType)
       .add("followee", LongType)
+
+    val topicSchema = new StructType()
+      .add("url", LongType)
+      .add("games", DoubleType)
+      .add("movies", DoubleType)
+      .add("music", DoubleType)
 
     val links = spark.read
       .option("delimiter", "\t")
       .schema(schema)
       .csv(inputGraphPath)
-      .repartition(col("follower"))
+      .cache()
+
+    val topics = spark.read
+      .option("delimiter", "\t")
+      .schema(topicSchema)
+      .csv(graphTopicsPath)
       .cache()
 
     val users = links
       .select(col("follower").as("user_id"))
       .union(links.select(col("followee").as("user_id")))
       .distinct()
-      .repartition(col("user_id"))
       .cache()
 
     val n = users.count()
@@ -67,86 +80,69 @@ object PageRank {
 
     val userFollows = links.groupBy("follower")
       .agg(collect_list("followee").as("followees"))
-      .repartition(col("follower"))
       .cache()
 
-    var ranks = userFollows
-      .select(col("followee").as("url"), lit(1.0 / n).as("rank"))
+    var ranks = users
+      .select(col("user_id").as("url"), lit(1.0 / n).as("rank"))
       .distinct()
       .repartition(col("url"))
 
-    ranks.show()
+    var vars = topics
+      .join(ranks, "url")
+      .withColumn("games_rec", array(topics("games"), topics("url")))
+      .withColumn("movies_rec", array(topics("movies"), topics("url")))
+      .withColumn("music_rec", array(topics("music"), topics("url")))
+      .select("url", "games_rec", "movies_rec", "music_rec", "rank")
 
-    for (i <- 1 to 1) {
+    val static = vars.cache()
+
+    for (i <- 1 to iterations) {
 
       sc.setJobDescription(s"PageRank iteration ${i}")
 
-      val contrib = userFollows.join(ranks, col("follower") === col("url"), "left")
+      val startTime = System.nanoTime()
+
+      val contrib = userFollows.join(vars, col("follower") === col("url"), "left")
         .withColumn("contrib", lit(col("rank") / size(col("followees"))))
-        .withColumn("followee", explode(col("followees")))
-        .select(col("followee"), col("contrib"))
+        .withColumn("followee", explode_outer(concat(col("followees"), array(col("follower")))))
+        .withColumn("contrib", when(col("followee") === col("follower"), lit(0.0)).otherwise(col("contrib")))
+//        .withColumn("games_rec", when(col("games_rec").isNull, null).when(col("games_rec._1") < 3.0, null).otherwise(col("games_rec")))
+//        .withColumn("movies_rec", when(col("movies_rec").isNull, null).when(col("movies_rec._1") < 3.0, null).otherwise(col("movies_rec")))
+//        .withColumn("music_rec", when(col("music_rec").isNull, null).when(col("music_rec._1") < 3.0, null).otherwise(col("music_rec")))
+        .select(col("followee"), col("contrib")) //, col("games_rec"), col("movies_rec"), col("music_rec"))
 
-      userFollows.show()
+//      contrib.show()
 
-      val dangling =
-        ( 1 - contrib.select(sum(col("contrib")).as("total")).first().getAs[Double]("total")) / n
-
-
-      ranks = contrib.select(col("followee").as("url"), col("contrib"))
+      vars = contrib.select(col("followee").as("url"), col("contrib"))
+        .repartition(col("url"))
         .groupBy("url")
         .agg(sum(col("contrib")).as("total_contrib"))
         .withColumn("rank",
-          lit(intercept) + lit(d) * (col("total_contrib") + lit(dangling))
+          lit(intercept) + lit(d) * (col("total_contrib") + (lit(1) - sum("total_contrib").over()) / lit(n))
         )
         .select(col("url"), col("rank"))
-        .repartition(col("url"))
-
-
-
-
-
-
-//      var newRecommend = selfGraph
-//        .join(userRecommends, "follower_id")
-//        .groupBy("user_id")
-//        .agg(
-//          max(col("games")).as("new_games"),
-//          max(col("movies")).as("new_movies"),
-//          max(col("music")).as("new_music")
-//        )
-//        .withColumnRenamed("user_id", "follower_id")
-//        .repartition(col("follower_id"))
-//
-//      userRecommends = userRecommends
-//        .join(newRecommend, Seq("follower_id"), "left")
-//        .withColumn("games", when(col("games").isNull, null).when(col("new_games").isNull, col("games")).otherwise(col("new_games")))
-//        .withColumn("movies", when(col("movies").isNull, null).when(col("new_movies").isNull, col("movies")).otherwise(col("new_movies")))
-//        .withColumn("music", when(col("music").isNull, null).when(col("new_music").isNull, col("music")).otherwise(col("new_music")))
-//        .drop("new_games", "new_movies", "new_music")
-//        .repartition(col("follower_id"))
-//        .cache()
 
        sc.setJobDescription(null)
+
+      val endTime = System.nanoTime()
+      val duration = (endTime - startTime) / 1e9
+      println(s"PageRank iteration ${i} took: $duration seconds")
      }
 
     sc.setJobDescription("PageRank saving results")
-//    ranks.show()
-//    ranks
-//      .write
-//      .option("delimiter", "\t")
-//      .option("header", "false")
-//      .csv(pageRankOutputPath)
 
+    var startTime = System.nanoTime()
 
-//    userRecommends
-//      .withColumn("recommendations", greatest(col("games"), col("movies"), col("music")))
-//      .withColumn("recommend_user_id", col("recommendations.follower_id"))
-//      .withColumn("recommend_freq", col("recommendations.freq"))
-//      .drop("games", "movies", "music", "recommendations")
-//      .write
-//      .option("delimiter", "\t")
-//      .option("header", "false")
-//      .csv(recsOutputPath)
+    vars
+      .select("url", "rank")
+      .write
+      .option("delimiter", "\t")
+      .option("header", "false")
+      .csv(pageRankOutputPath)
+
+    var endTime = System.nanoTime()
+    var duration = (endTime - startTime) / 1e9
+    println(s"PageRank saving results took: $duration seconds")
 
     sc.setJobDescription(null)
   }

@@ -1,4 +1,5 @@
 import org.apache.log4j.LogManager
+import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.{Column, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{DoubleType, LongType, StructType}
@@ -89,12 +90,20 @@ object PageRank {
 
     var vars = topics
       .join(ranks, "url")
-      .withColumn("games_rec", array(topics("games"), topics("url")))
-      .withColumn("movies_rec", array(topics("movies"), topics("url")))
-      .withColumn("music_rec", array(topics("music"), topics("url")))
+      .withColumn("games_rec", when(topics("games") < 3.0, null).otherwise(array(topics("games").cast(DoubleType), topics("url"))))
+      .withColumn("movies_rec", when(topics("movies") < 3.0, null).otherwise(array(topics("movies").cast(DoubleType), topics("url"))))
+      .withColumn("music_rec", when(topics("music") < 3.0, null).otherwise(array(topics("music").cast(DoubleType), topics("url"))))
       .select("url", "games_rec", "movies_rec", "music_rec", "rank")
 
-    val static = vars.cache()
+    val static = vars
+      .withColumnRenamed("rank", "static_rank")
+      .withColumnRenamed("games_rec", "static_games_rec")
+      .withColumnRenamed("movies_rec", "static_movies_rec")
+      .withColumnRenamed("music_rec", "static_music_rec")
+      .cache()
+
+    val window = Window.partitionBy("url")
+
 
     for (i <- 1 to iterations) {
 
@@ -106,21 +115,27 @@ object PageRank {
         .withColumn("contrib", lit(col("rank") / size(col("followees"))))
         .withColumn("followee", explode_outer(concat(col("followees"), array(col("follower")))))
         .withColumn("contrib", when(col("followee") === col("follower"), lit(0.0)).otherwise(col("contrib")))
-//        .withColumn("games_rec", when(col("games_rec").isNull, null).when(col("games_rec._1") < 3.0, null).otherwise(col("games_rec")))
-//        .withColumn("movies_rec", when(col("movies_rec").isNull, null).when(col("movies_rec._1") < 3.0, null).otherwise(col("movies_rec")))
-//        .withColumn("music_rec", when(col("music_rec").isNull, null).when(col("music_rec._1") < 3.0, null).otherwise(col("music_rec")))
-        .select(col("followee"), col("contrib")) //, col("games_rec"), col("movies_rec"), col("music_rec"))
+        .select(col("followee"), col("contrib"), col("games_rec"), col("movies_rec"), col("music_rec"))
 
-//      contrib.show()
-
-      vars = contrib.select(col("followee").as("url"), col("contrib"))
+      vars = contrib.select(col("followee").as("url"), col("contrib"), col("games_rec"), col("movies_rec"), col("music_rec"))
         .repartition(col("url"))
         .groupBy("url")
-        .agg(sum(col("contrib")).as("total_contrib"))
+        .agg(
+          sum(col("contrib")).as("total_contrib"),
+          max(col("games_rec")).as("games_rec"),
+          max(col("movies_rec")).as("movies_rec"),
+          max(col("music_rec")).as("music_rec")
+        )
         .withColumn("rank",
           lit(intercept) + lit(d) * (col("total_contrib") + (lit(1) - sum("total_contrib").over()) / lit(n))
         )
-        .select(col("url"), col("rank"))
+        .select(col("url"), col("rank"), col("games_rec"), col("movies_rec"), col("music_rec"))
+
+      vars = vars.join(static, "url")
+        .withColumn("games_rec", when(col("static_games_rec")(0).isNull, null).otherwise(col("games_rec")))
+        .withColumn("movies_rec", when(col("static_movies_rec")(0).isNull, null).otherwise(col("movies_rec")))
+        .withColumn("music_rec", when(col("static_music_rec")(0)isNull, null).otherwise(col("music_rec")))
+        .select("url", "games_rec", "movies_rec", "music_rec", "rank")
 
        sc.setJobDescription(null)
 
@@ -133,6 +148,17 @@ object PageRank {
 
     var startTime = System.nanoTime()
 
+    vars.cache()
+
+    vars
+      .withColumn("recs", greatest(col("games_rec"), col("movies_rec"), col("music_rec")))
+      .select(col("url"), col("recs")(1).cast(LongType), col("recs")(0))
+      .write
+      .option("delimiter", "\t")
+      .option("header", "false")
+      .csv(recsOutputPath)
+
+
     vars
       .select("url", "rank")
       .write
@@ -140,9 +166,10 @@ object PageRank {
       .option("header", "false")
       .csv(pageRankOutputPath)
 
-    var endTime = System.nanoTime()
-    var duration = (endTime - startTime) / 1e9
+    val endTime = System.nanoTime()
+    val duration = (endTime - startTime) / 1e9
     println(s"PageRank saving results took: $duration seconds")
+
 
     sc.setJobDescription(null)
   }

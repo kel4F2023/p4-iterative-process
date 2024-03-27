@@ -62,14 +62,12 @@ object PageRank {
       .option("delimiter", "\t")
       .schema(schema)
       .csv(inputGraphPath)
-      .repartition(col("follower"))
       .cache()
 
     val topics = spark.read
       .option("delimiter", "\t")
       .schema(topicSchema)
       .csv(graphTopicsPath)
-      .repartition(col("url"))
       .cache()
 
     val users = links
@@ -83,13 +81,11 @@ object PageRank {
 
     val userFollows = links.groupBy("follower")
       .agg(collect_list("followee").as("followees"))
-      .repartition(col("follower"))
       .cache()
 
     val ranks = users
       .select(col("user_id").as("url"), lit(1.0 / n).as("rank"))
       .distinct()
-      .repartition(col("url"))
 
     var vars = topics
       .join(ranks, "url")
@@ -97,7 +93,6 @@ object PageRank {
       .withColumn("movies_rec", when(topics("movies") < 3.0, null).otherwise(array(topics("movies").cast(DoubleType), topics("url"))))
       .withColumn("music_rec", when(topics("music") < 3.0, null).otherwise(array(topics("music").cast(DoubleType), topics("url"))))
       .select("url", "games_rec", "movies_rec", "music_rec", "rank")
-      .repartition(col("url"))
 
     val static = vars
       .withColumnRenamed("rank", "static_rank")
@@ -118,10 +113,8 @@ object PageRank {
         .withColumn("followee", explode_outer(concat(col("followees"), array(col("follower")))))
         .withColumn("contrib", when(col("followee") === col("follower"), lit(0.0)).otherwise(col("contrib")))
         .select(col("followee"), col("contrib"), col("games_rec"), col("movies_rec"), col("music_rec"))
-        .repartition(col("followee"))
 
       vars = contrib.select(col("followee").as("url"), col("contrib"), col("games_rec"), col("movies_rec"), col("music_rec"))
-        .repartition(col("url"))
         .groupBy("url")
         .agg(
           sum(col("contrib")).as("total_contrib"),
@@ -133,14 +126,12 @@ object PageRank {
           lit(intercept) + lit(d) * (col("total_contrib") + (lit(1) - sum("total_contrib").over()) / lit(n))
         )
         .select(col("url"), col("rank"), col("games_rec"), col("movies_rec"), col("music_rec"))
-        .repartition(col("url"))
 
       vars = vars.join(static, "url")
         .withColumn("games_rec", when(col("static_games_rec")(0).isNull, null).otherwise(col("games_rec")))
         .withColumn("movies_rec", when(col("static_movies_rec")(0).isNull, null).otherwise(col("movies_rec")))
         .withColumn("music_rec", when(col("static_music_rec")(0)isNull, null).otherwise(col("music_rec")))
         .select("url", "games_rec", "movies_rec", "music_rec", "rank")
-        .repartition(col("url"))
 
        sc.setJobDescription(null)
 
